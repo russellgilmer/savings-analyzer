@@ -2,6 +2,7 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import re
+from fuzzywuzzy import process
 from openai import OpenAI
 
 st.set_page_config(page_title="Merchant Statement Savings Analyzer", layout="wide")
@@ -14,7 +15,6 @@ def load_clean_rate_sheet():
     xls = pd.ExcelFile("Curbstone Statement Template.xlsx")
     df_rates = pd.read_excel(xls, sheet_name="Interchange Savings")
 
-    # Start at valid rows
     df_clean = df_rates.iloc[12:].copy()
     df_clean.columns = [
         "Category", "Volume", "Current Fee", "Current Cost",
@@ -22,7 +22,6 @@ def load_clean_rate_sheet():
     ]
     df_clean = df_clean.dropna(subset=["Category"])
 
-    # Remove notes/footers
     invalid_patterns = ["Effective", "Downgrade", "Categories that", "Depending on", "***", "**", "*"]
     def is_valid_category(cat):
         for pat in invalid_patterns:
@@ -33,7 +32,6 @@ def load_clean_rate_sheet():
     df_valid = df_clean[df_clean["Category"].apply(is_valid_category)].copy()
     df_valid = df_valid[["Category", "Current Fee", "Optimized Fee"]]
 
-    # Normalize numeric
     df_valid["Current Fee"] = pd.to_numeric(df_valid["Current Fee"], errors="coerce")
     df_valid["Optimized Fee"] = pd.to_numeric(df_valid["Optimized Fee"], errors="coerce")
     return df_valid
@@ -44,7 +42,6 @@ rate_sheet = load_clean_rate_sheet()
 # HELPERS
 # ===============================
 def normalize_rate(val):
-    """Ensure rates are in decimal form (0.025 not 2.5)."""
     if val is None:
         return 0.0
     try:
@@ -53,22 +50,17 @@ def normalize_rate(val):
     except:
         return 0.0
 
-def extract_network(line_text):
-    """Detect Visa or MC from statement text."""
-    if "VS" in line_text.upper() or "VI" in line_text.upper():
+def extract_network(text):
+    if "VS" in text.upper() or "VI" in text.upper():
         return "Visa"
-    elif "MC" in line_text.upper():
+    elif "MC" in text.upper():
         return "Mastercard"
     return "Other"
 
 # ===============================
-# PDF EXTRACTION (BROAD)
+# PDF EXTRACTION
 # ===============================
 def extract_statement_lines(pdf_file):
-    """
-    Extracts ANY line with VS/MC/VI and a %/rate.
-    Broad extraction so GPT can reason which are valid categories.
-    """
     valid_lines = []
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
@@ -76,64 +68,52 @@ def extract_statement_lines(pdf_file):
             if not text:
                 continue
             for line in text.split("\n"):
-                # Must have Visa/MC AND at least one numeric rate
                 if re.search(r"(VS|VI|MC)", line.upper()) and re.search(r"\d+\.\d{1,4}", line):
                     valid_lines.append(line.strip())
     return list(set(valid_lines))
 
 def parse_line(line):
-    """Extract category text, volume, and discount % rate."""
-    # Category = text before first $
     category_text = line.split("$")[0].strip()
-
-    # Volume (first $amount)
     vol_match = re.findall(r"\$[\d,]+\.\d{2}", line)
     volume = float(vol_match[0].replace("$","").replace(",","")) if vol_match else 0.0
 
-    # Discount % = LAST numeric in the line
     rate_match = re.findall(r"\d+\.\d{1,4}", line)
     stmt_rate = 0.0
     if rate_match:
         stmt_rate = float(rate_match[-1])
-        if stmt_rate > 1:  # convert % to decimal
+        if stmt_rate > 1:
             stmt_rate = stmt_rate / 100
-
     return category_text, volume, stmt_rate
 
 # ===============================
-# GPT REASONING
+# GPT MATCHING
 # ===============================
-def gpt_reason_match(statement_category, statement_rate, network, df_network, api_key):
-    """Ask GPT to reason the best match from network-specific categories."""
+def gpt_reason_match(statement_category, statement_rate, network, candidate_rows, api_key):
     client = OpenAI(api_key=api_key)
 
-    # Build the list GPT sees (only network-specific categories)
-    category_text = "\n".join(
+    candidate_text = "\n".join(
         f"- {row['Category']} (Current Fee: {normalize_rate(row['Current Fee']):.4%}, Optimized: {normalize_rate(row['Optimized Fee']):.4%})"
-        for _, row in df_network.iterrows()
+        for _, row in candidate_rows.iterrows()
     )
 
     prompt = f"""
     You are a payment interchange expert.
 
-    Merchant statement line:
-    - Description: "{statement_category}"
+    Merchant statement:
+    - "{statement_category}"
     - Network: {network}
     - Discount Rate: {statement_rate:.4%}
 
-    Standard {network} categories available:
-    {category_text}
+    Possible matching {network} categories:
+    {candidate_text}
 
-    Your task:
-    1. Decide if this statement category logically matches any of the listed categories.
-    2. Consider:
-       - Network alignment (Visa vs MC)
-       - Keyword similarity (Purchasing ≈ Purchasing, Level 2 ≈ LVL II)
-       - Discount rate closeness
-    3. If you can confidently match, choose the best one.
-    4. If no clear match, say "No Match".
+    Reason like a human:
+    - Compare keywords (Purchasing ≈ Purchasing, Level 2 ≈ LVL II)
+    - Compare rates (2.5% = 0.025)
+    - Pick the closest even if not exact
+    - If truly no match, say "No Match"
 
-    Respond ONLY in JSON:
+    Respond in JSON:
     {{
       "best_match": "...",
       "reason": "...",
@@ -144,27 +124,27 @@ def gpt_reason_match(statement_category, statement_rate, network, df_network, ap
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "You are a payment interchange expert mapping statement lines to standardized interchange categories."},
+            {"role": "system", "content": "You are a payment interchange expert mapping merchant statement categories to standard interchange categories."},
             {"role": "user", "content": prompt}
         ]
     )
     return completion.choices[0].message.content
 
 # ===============================
-# MATCHING LOOP (GPT-DRIVEN)
+# HYBRID MATCH LOOP
 # ===============================
-def gpt_match_and_calculate(lines, df_clean, api_key):
+def hybrid_match_and_calculate(lines, df_clean, api_key):
     results = []
 
     for line in lines:
         cat_text, volume, stmt_rate = parse_line(line)
-        if stmt_rate == 0:  # skip if no valid rate
+        if stmt_rate == 0:
             continue
 
         # Detect network
         network = extract_network(cat_text)
 
-        # Filter spreadsheet to that network
+        # Filter spreadsheet to network
         if network == "Visa":
             df_net = df_clean[df_clean["Category"].str.contains("VI|Visa", case=False)]
         elif network == "Mastercard":
@@ -172,8 +152,16 @@ def gpt_match_and_calculate(lines, df_clean, api_key):
         else:
             df_net = df_clean
 
-        # Ask GPT to reason best match
-        gpt_raw = gpt_reason_match(cat_text, stmt_rate, network, df_net, api_key)
+        # Fuzzy pre-filter: find top 15 closest by name
+        top_matches = []
+        for cat in df_net["Category"].tolist():
+            score = process.extractOne(cat_text, [cat])[1]
+            top_matches.append((cat, score))
+        top_matches = sorted(top_matches, key=lambda x: x[1], reverse=True)[:15]
+        top_df = df_net[df_net["Category"].isin([m[0] for m in top_matches])]
+
+        # GPT reasons among top 15
+        gpt_raw = gpt_reason_match(cat_text, stmt_rate, network, top_df, api_key)
 
         try:
             import json
@@ -186,7 +174,6 @@ def gpt_match_and_calculate(lines, df_clean, api_key):
             reason = "GPT parsing failed"
             confidence = 0
 
-        # Lookup optimized fee if matched
         opt_rate, curr_fee_ref, savings = 0.0, 0.0, 0.0
         if matched_cat and matched_cat != "No Match":
             match_row = df_net[df_net["Category"] == matched_cat]
@@ -204,7 +191,7 @@ def gpt_match_and_calculate(lines, df_clean, api_key):
             "Volume": volume,
             "Monthly Savings": savings,
             "Confidence": confidence,
-            "Reason": reason  # ✅ GPT explanation
+            "Reason": reason
         })
 
     return pd.DataFrame(results)
@@ -212,21 +199,15 @@ def gpt_match_and_calculate(lines, df_clean, api_key):
 # ===============================
 # STREAMLIT UI
 # ===============================
-st.title("💳 Merchant Statement Interchange Savings Analyzer (AI Reasoning)")
+st.title("💳 Merchant Statement Analyzer (Hybrid Fuzzy + GPT Reasoning)")
 
 st.markdown("""
-This version uses **GPT reasoning like a human analyst**:
-
+**How this works:**
 1. Extracts all Visa/MC lines with a discount %  
-2. Sends each line to GPT with all network-specific categories  
-3. GPT reasons using:
-   - Network (Visa vs MC)  
-   - Keyword similarity  
-   - Rate closeness  
-4. GPT decides best match OR says *No Match*  
-5. Savings = Volume × (Statement Rate – Optimized Fee)  
-
-**You will also see GPT’s explanation for each match.**
+2. Fuzzy pre-filters top 15 most similar categories for that network  
+3. GPT reasons like a human to pick the closest match (or No Match)  
+4. GPT explains its reasoning  
+5. Savings = Volume × (Statement Rate – Optimized Fee)
 """)
 
 api_key = st.text_input("Enter your OpenAI API Key", type="password")
@@ -237,12 +218,12 @@ if uploaded_pdf and api_key:
         statement_lines = extract_statement_lines(uploaded_pdf)
         st.success(f"✅ Found {len(statement_lines)} lines with VS/MC + discount rates")
 
-    if st.button("Run AI Analysis"):
-        with st.spinner("Sending lines to GPT for reasoning..."):
-            savings_df = gpt_match_and_calculate(statement_lines[:10], rate_sheet, api_key)
+    if st.button("Run Hybrid AI Analysis"):
+        with st.spinner("Fuzzy filtering → GPT reasoning → Calculating savings..."):
+            savings_df = hybrid_match_and_calculate(statement_lines[:10], rate_sheet, api_key)
             total_savings = savings_df["Monthly Savings"].sum()
 
-            st.subheader("📊 GPT-Matched Savings Summary (with Reasoning)")
+            st.subheader("📊 GPT Hybrid Matches (with Reasoning)")
             st.dataframe(savings_df)
 
             st.markdown(f"**💰 Total Potential Monthly Savings: ${total_savings:,.2f}**")
@@ -258,4 +239,4 @@ else:
     st.info("⬆️ Upload a PDF and enter your OpenAI API key to start.")
 
 st.markdown("---")
-st.caption("Powered by Curbstone + GPT human-like reasoning for interchange matching")
+st.caption("Powered by Curbstone + Hybrid Fuzzy Filtering + GPT Reasoning")
