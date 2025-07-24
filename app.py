@@ -8,7 +8,7 @@ from openai import OpenAI
 st.set_page_config(page_title="Merchant Statement Savings Analyzer", layout="wide")
 
 # ===============================
-# RATE SHEET LOADING & CLEANING
+# LOAD & CLEAN RATE SHEET
 # ===============================
 @st.cache_data
 def load_clean_rate_sheet():
@@ -43,7 +43,7 @@ def load_clean_rate_sheet():
 rate_sheet = load_clean_rate_sheet()
 
 # ===============================
-# HELPER: RATE NORMALIZATION
+# RATE NORMALIZATION
 # ===============================
 def normalize_rate(val):
     """Ensure rates are in decimal form (0.025 not 2.5)."""
@@ -69,25 +69,34 @@ def extract_categories_from_pdf(pdf_file):
             if not text:
                 continue
             for line in text.split("\n"):
-                # Must have VS/VI/MC AND known keyword AND a % or decimal rate
+                # Must have VS/VI/MC AND known keyword AND a %/rate
                 if re.search(r"(VS|VI|MC)", line.upper()) and \
                    any(k in line.upper() for k in CATEGORY_KEYWORDS) and \
-                   re.search(r"\d+\.\d{2}", line):
+                   re.search(r"\d+\.\d{1,4}", line):
                     extracted.append(line.strip())
     return list(set(extracted))  # unique valid lines only
 
 def parse_line_to_components(line):
-    """Extract category text, volume, and normalized rate."""
+    """Extract category, volume, and discount % rate (not total fee)."""
     # Category text before first $
     category = line.split("$")[0].strip()
 
-    # Volume
+    # Volume (first $amount in line)
     volume_match = re.findall(r"\$[\d,]+\.\d{2}", line)
     volume = float(volume_match[0].replace("$","").replace(",","")) if volume_match else 0.0
 
-    # Rate (normalize)
-    rate_match = re.findall(r"\d+\.\d{2,4}", line)
-    stmt_rate = normalize_rate(rate_match[-1]) if rate_match else 0.0
+    # Find the LAST numeric rate (most likely discount %)
+    rate_match = re.findall(r"\d+\.\d{1,4}", line)
+    stmt_rate = 0.0
+    if rate_match:
+        stmt_rate = float(rate_match[-1])
+        # If it's >1 treat as % → convert to decimal
+        if stmt_rate > 1:
+            stmt_rate = stmt_rate / 100
+
+    # Sanity check: valid rates between 0.5% and 5%
+    if stmt_rate < 0.005 or stmt_rate > 0.05:
+        stmt_rate = 0.0
 
     return category, volume, stmt_rate
 
@@ -106,9 +115,9 @@ def gpt_choose_best(statement_category, statement_rate, candidates, api_key):
 
     Statement category:
     "{statement_category}"
-    Statement rate: {statement_rate:.4%}
+    Statement discount rate: {statement_rate:.4%}
 
-    Possible matches:
+    Possible standard interchange categories:
     {candidate_text}
 
     Choose the best match considering:
@@ -140,6 +149,8 @@ def match_and_calculate(lines, df_clean, api_key):
 
     for line in lines:
         cat_text, volume, stmt_rate = parse_line_to_components(line)
+
+        # Skip invalid lines
         if stmt_rate == 0 or not cat_text:
             continue
 
@@ -160,7 +171,7 @@ def match_and_calculate(lines, df_clean, api_key):
         if keyword_hits:
             key_df = key_df[key_df["Category"].str.contains("|".join(keyword_hits), case=False)]
 
-        # Step 3: Rate sanity filter (within 0.5%)
+        # Step 3: Rate sanity filter (within 0.5% difference)
         rate_df = key_df.copy()
         if stmt_rate > 0:
             rate_df["diff"] = abs(normalize_rate(rate_df["Current Fee"]) - stmt_rate)
@@ -220,12 +231,13 @@ def match_and_calculate(lines, df_clean, api_key):
 st.title("💳 Merchant Statement Interchange Savings Analyzer")
 
 st.markdown("""
-**How it works:**
+**How it works now:**
 1. Extracts only valid Visa/MC interchange lines (skips dates & totals)
-2. Normalizes rates (1.9% = 0.019)
-3. Filters by network, keywords, and rate similarity
-4. Uses GPT ONLY for final ambiguous matches
-5. Calculates potential savings
+2. Pulls **discount % rate** (NOT total fee)
+3. Normalizes rates (2.5% = 0.025)
+4. Filters by network, keywords, and rate similarity
+5. Uses GPT ONLY if multiple candidates remain
+6. Calculates potential savings
 """)
 
 api_key = st.text_input("Enter your OpenAI API Key", type="password")
