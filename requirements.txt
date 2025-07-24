@@ -4,3 +4,4 @@ pandas
 openai
 fuzzywuzzy
 python-Levenshtein
+openpyxl
