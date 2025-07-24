@@ -11,22 +11,46 @@ from openai import OpenAI
 st.set_page_config(page_title="Merchant Statement Savings Analyzer", layout="wide")
 
 # ===============================
-# LOAD RATE SHEET
+# LOAD & CLEAN RATE SHEET
 # ===============================
 @st.cache_data
-def load_rate_sheet():
-    """Load the Curbstone template and return a cleaned dataframe."""
+def load_clean_rate_sheet():
+    """Load the Curbstone template, clean out notes, keep only valid categories with both fees."""
     xls = pd.ExcelFile("Curbstone Statement Template.xlsx")
     df_rates = pd.read_excel(xls, sheet_name="Interchange Savings")
+
+    # Start at valid rows
     df_clean = df_rates.iloc[12:].copy()
     df_clean.columns = [
         "Category", "Volume", "Current Fee", "Current Cost",
         "Optimized Fee", "Adjusted Cost", "Savings", "Optimization Type"
     ]
-    df_clean = df_clean.dropna(subset=["Category"])
-    return df_clean
 
-rate_sheet = load_rate_sheet()
+    # Drop empty rows
+    df_clean = df_clean.dropna(subset=["Category"])
+
+    # Filter only valid categories (remove notes/explanations)
+    invalid_patterns = ["Effective", "Downgrade", "Categories that", "Depending on", "***", "**", "*"]
+    def is_valid_category(cat):
+        if pd.isna(cat):
+            return False
+        for pat in invalid_patterns:
+            if pat.lower() in str(cat).lower():
+                return False
+        return True
+
+    df_valid_full = df_clean[df_clean["Category"].apply(is_valid_category)].copy()
+
+    # Keep only necessary columns
+    df_valid_trimmed = df_valid_full[["Category", "Current Fee", "Optimized Fee"]].copy()
+
+    # Convert to numeric
+    df_valid_trimmed["Current Fee"] = pd.to_numeric(df_valid_trimmed["Current Fee"], errors="coerce")
+    df_valid_trimmed["Optimized Fee"] = pd.to_numeric(df_valid_trimmed["Optimized Fee"], errors="coerce")
+
+    return df_valid_trimmed
+
+rate_sheet = load_clean_rate_sheet()
 
 # ===============================
 # PDF PARSING
@@ -49,24 +73,24 @@ def parse_line_to_components(line):
     # Take text before first $
     parts = line.split("$")
     category = parts[0].strip()
-    
+
     # Volume (first $amount in line)
     volume_match = re.findall(r"\$[\d,]+\.\d{2}", line)
     volume = float(volume_match[0].replace("$","").replace(",","")) if volume_match else 0.0
-    
+
     # Rate (like 2.2000)
     rate_match = re.findall(r"\d\.\d{3,4}", line)
     rate = float(rate_match[-1]) if rate_match else 0.0
-    
+
     return category, volume, rate
 
 # ===============================
-# GPT CATEGORY MATCHING (NEW OPENAI API)
+# GPT CATEGORY MATCHING
 # ===============================
 def gpt_match_category(statement_category, known_categories, api_key):
     """Use GPT to match a single statement category to the closest known category."""
     client = OpenAI(api_key=api_key)  # ✅ Create client *inside* the function
-    
+
     prompt = f"""
     You are a payment interchange expert.
 
@@ -91,17 +115,20 @@ def gpt_match_category(statement_category, known_categories, api_key):
     )
     return completion.choices[0].message.content
 
+# ===============================
+# MATCH + VALIDATE + CALCULATE
+# ===============================
 def match_and_calculate(categories_extracted, df_clean, api_key):
-    """For each parsed line, GPT matches it, then we calculate savings."""
+    """For each parsed line, GPT matches it, then we calculate savings & confidence."""
     known_categories = df_clean["Category"].dropna().tolist()
     results = []
-    
+
     for line in categories_extracted:
         cat, volume, stmt_rate = parse_line_to_components(line)
-        
+
         # GPT match
         gpt_result_raw = gpt_match_category(cat, known_categories, api_key)
-        
+
         # Try parsing GPT JSON
         try:
             import json
@@ -110,21 +137,40 @@ def match_and_calculate(categories_extracted, df_clean, api_key):
         except:
             # Fallback: fuzzy match if GPT JSON fails
             matched_cat = process.extractOne(cat, known_categories)[0]
-        
-        # Optimized rate lookup
+
+        # Pull Current Fee & Optimized Fee for matched category
         opt_row = df_clean[df_clean["Category"] == matched_cat]
-        opt_rate = float(opt_row["Optimized Fee"].values[0]) if not opt_row.empty else 0.019
-        
+        if not opt_row.empty:
+            current_fee_ref = float(opt_row["Current Fee"].values[0])
+            opt_rate = float(opt_row["Optimized Fee"].values[0])
+        else:
+            current_fee_ref = 0.0
+            opt_rate = 0.019  # default fallback
+
+        # Confidence check: compare statement rate vs reference current fee
+        if current_fee_ref > 0:
+            rate_diff = abs(stmt_rate - current_fee_ref)
+            if rate_diff <= 0.003:  # within ~0.3%
+                confidence = "High"
+            else:
+                confidence = "Low (Rate mismatch)"
+        else:
+            confidence = "Unknown"
+
         # Calculate savings
         savings = volume * (stmt_rate - opt_rate)
+
         results.append({
             "Statement Category": cat,
             "Matched": matched_cat,
-            "Volume": volume,
             "Statement Rate": stmt_rate,
+            "Ref Current Fee": current_fee_ref,
             "Optimized Rate": opt_rate,
-            "Monthly Savings": savings
+            "Volume": volume,
+            "Monthly Savings": savings,
+            "Confidence": confidence
         })
+
     return pd.DataFrame(results)
 
 # ===============================
@@ -134,7 +180,7 @@ st.title("💳 Merchant Statement Interchange Savings Analyzer")
 
 st.markdown("""
 Upload a merchant credit card statement PDF.  
-The tool will extract interchange categories, match them to your standard categories, and calculate potential savings.
+The tool will extract interchange categories, match them to your standard categories, validate by rate, and calculate potential savings.
 """)
 
 # OpenAI API key input
@@ -151,7 +197,7 @@ if uploaded_pdf and api_key:
 
     # Step 2: Run GPT matching & savings
     if st.button("Run Analysis"):
-        with st.spinner("Matching categories with GPT + calculating savings..."):
+        with st.spinner("Matching categories with GPT, validating by rate & calculating savings..."):
             # Limit to first 10 for demo speed (remove limit for full processing)
             savings_df = match_and_calculate(categories_extracted[:10], rate_sheet, api_key)
             total_savings = savings_df["Monthly Savings"].sum()
