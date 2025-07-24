@@ -8,7 +8,7 @@ from openai import OpenAI
 st.set_page_config(page_title="Merchant Statement Savings Analyzer", layout="wide")
 
 # ===============================
-# LOAD & CLEAN RATE SHEET
+# LOAD RATE SHEET
 # ===============================
 @st.cache_data
 def load_clean_rate_sheet():
@@ -86,9 +86,9 @@ def parse_line(line):
     return category_text, volume, stmt_rate
 
 # ===============================
-# GPT MATCHING
+# FEW-SHOT GPT MATCHING
 # ===============================
-def gpt_reason_match(statement_category, statement_rate, network, candidate_rows, api_key):
+def gpt_reason_match_fewshot(statement_category, statement_rate, network, candidate_rows, api_key):
     client = OpenAI(api_key=api_key)
 
     candidate_text = "\n".join(
@@ -96,30 +96,43 @@ def gpt_reason_match(statement_category, statement_rate, network, candidate_rows
         for _, row in candidate_rows.iterrows()
     )
 
+    few_shot_examples = """
+Example 1:
+Statement: "VS CR Purchasing Card Level 2" (2.50%)
+Matches: "VS Purchasing LVL II" because 'Purchasing Level 2' ≈ 'Purchasing LVL II' and rates align (2.50% ≈ 0.0250).
+
+Example 2:
+Statement: "MC Bus Tier 4 Lvl II" (2.95%)
+Matches: "MC Business Tier 4 LVL II" because 'Bus Tier 4 Lvl II' ≈ 'Business Tier 4 LVL II' and rates align (2.95% ≈ 0.0295).
+
+Remember:
+- 2.50% = 0.025, 2.95% = 0.0295
+- Always pick the closest match, even if not perfect.
+- Only say "No Match" if truly nothing makes sense.
+"""
+
     prompt = f"""
-    You are a payment interchange expert.
+You are a payment interchange expert mapping statement lines to standard interchange categories.
 
-    Merchant statement:
-    - "{statement_category}"
-    - Network: {network}
-    - Discount Rate: {statement_rate:.4%}
+{few_shot_examples}
 
-    Possible matching {network} categories:
-    {candidate_text}
+Now analyze this merchant statement:
+- "{statement_category}"
+- Network: {network}
+- Discount Rate: {statement_rate:.4%}
 
-    Reason like a human:
-    - Compare keywords (Purchasing ≈ Purchasing, Level 2 ≈ LVL II)
-    - Compare rates (2.5% = 0.025)
-    - Pick the closest even if not exact
-    - If truly no match, say "No Match"
+Possible matching {network} categories:
+{candidate_text}
 
-    Respond in JSON:
-    {{
-      "best_match": "...",
-      "reason": "...",
-      "confidence": 0-100
-    }}
-    """
+Pick the closest match and explain why.
+
+Respond ONLY as JSON:
+{{
+  "best_match": "...",
+  "reason": "...",
+  "confidence": 0-100
+}}
+"""
 
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -131,9 +144,9 @@ def gpt_reason_match(statement_category, statement_rate, network, candidate_rows
     return completion.choices[0].message.content
 
 # ===============================
-# HYBRID MATCH LOOP
+# HYBRID MATCH LOOP (FEW-SHOT)
 # ===============================
-def hybrid_match_and_calculate(lines, df_clean, api_key):
+def hybrid_match_and_calculate_fewshot(lines, df_clean, api_key):
     results = []
 
     for line in lines:
@@ -152,7 +165,7 @@ def hybrid_match_and_calculate(lines, df_clean, api_key):
         else:
             df_net = df_clean
 
-        # Fuzzy pre-filter: find top 15 closest by name
+        # Fuzzy pre-filter: top 15 closest by name
         top_matches = []
         for cat in df_net["Category"].tolist():
             score = process.extractOne(cat_text, [cat])[1]
@@ -160,8 +173,8 @@ def hybrid_match_and_calculate(lines, df_clean, api_key):
         top_matches = sorted(top_matches, key=lambda x: x[1], reverse=True)[:15]
         top_df = df_net[df_net["Category"].isin([m[0] for m in top_matches])]
 
-        # GPT reasons among top 15
-        gpt_raw = gpt_reason_match(cat_text, stmt_rate, network, top_df, api_key)
+        # GPT reasons among top 15 with few-shot examples
+        gpt_raw = gpt_reason_match_fewshot(cat_text, stmt_rate, network, top_df, api_key)
 
         try:
             import json
@@ -199,15 +212,16 @@ def hybrid_match_and_calculate(lines, df_clean, api_key):
 # ===============================
 # STREAMLIT UI
 # ===============================
-st.title("💳 Merchant Statement Analyzer (Hybrid Fuzzy + GPT Reasoning)")
+st.title("💳 Merchant Statement Analyzer (Few-Shot Guided GPT)")
 
 st.markdown("""
 **How this works:**
 1. Extracts all Visa/MC lines with a discount %  
-2. Fuzzy pre-filters top 15 most similar categories for that network  
-3. GPT reasons like a human to pick the closest match (or No Match)  
-4. GPT explains its reasoning  
-5. Savings = Volume × (Statement Rate – Optimized Fee)
+2. Fuzzy pre-filters top 15 closest network categories  
+3. GPT sees **examples of correct matches** and learns how to reason  
+4. GPT always picks the closest match (low confidence if unsure)  
+5. GPT explains **why** it matched  
+6. Savings = Volume × (Statement Rate – Optimized Fee)
 """)
 
 api_key = st.text_input("Enter your OpenAI API Key", type="password")
@@ -218,12 +232,12 @@ if uploaded_pdf and api_key:
         statement_lines = extract_statement_lines(uploaded_pdf)
         st.success(f"✅ Found {len(statement_lines)} lines with VS/MC + discount rates")
 
-    if st.button("Run Hybrid AI Analysis"):
-        with st.spinner("Fuzzy filtering → GPT reasoning → Calculating savings..."):
-            savings_df = hybrid_match_and_calculate(statement_lines[:10], rate_sheet, api_key)
+    if st.button("Run Guided AI Analysis"):
+        with st.spinner("Fuzzy filtering → GPT guided reasoning → Calculating savings..."):
+            savings_df = hybrid_match_and_calculate_fewshot(statement_lines[:10], rate_sheet, api_key)
             total_savings = savings_df["Monthly Savings"].sum()
 
-            st.subheader("📊 GPT Hybrid Matches (with Reasoning)")
+            st.subheader("📊 GPT Guided Matches (with Reasoning)")
             st.dataframe(savings_df)
 
             st.markdown(f"**💰 Total Potential Monthly Savings: ${total_savings:,.2f}**")
@@ -239,4 +253,4 @@ else:
     st.info("⬆️ Upload a PDF and enter your OpenAI API key to start.")
 
 st.markdown("---")
-st.caption("Powered by Curbstone + Hybrid Fuzzy Filtering + GPT Reasoning")
+st.caption("Powered by Curbstone + Few-Shot Guided GPT Reasoning")
