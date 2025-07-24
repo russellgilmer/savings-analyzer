@@ -5,17 +5,13 @@ import re
 from fuzzywuzzy import process
 from openai import OpenAI
 
-# ===============================
-# STREAMLIT CONFIG
-# ===============================
 st.set_page_config(page_title="Merchant Statement Savings Analyzer", layout="wide")
 
 # ===============================
-# LOAD & CLEAN RATE SHEET
+# RATE SHEET LOADING & CLEANING
 # ===============================
 @st.cache_data
 def load_clean_rate_sheet():
-    """Load the Curbstone template, clean out notes, keep only valid categories with both fees."""
     xls = pd.ExcelFile("Curbstone Statement Template.xlsx")
     df_rates = pd.read_excel(xls, sheet_name="Interchange Savings")
 
@@ -26,91 +22,99 @@ def load_clean_rate_sheet():
         "Optimized Fee", "Adjusted Cost", "Savings", "Optimization Type"
     ]
 
-    # Drop empty rows
     df_clean = df_clean.dropna(subset=["Category"])
 
-    # Filter only valid categories (remove notes/explanations)
+    # Filter out notes/footers
     invalid_patterns = ["Effective", "Downgrade", "Categories that", "Depending on", "***", "**", "*"]
     def is_valid_category(cat):
-        if pd.isna(cat):
-            return False
         for pat in invalid_patterns:
             if pat.lower() in str(cat).lower():
                 return False
         return True
 
-    df_valid_full = df_clean[df_clean["Category"].apply(is_valid_category)].copy()
+    df_valid = df_clean[df_clean["Category"].apply(is_valid_category)].copy()
+    df_valid = df_valid[["Category", "Current Fee", "Optimized Fee"]]
 
-    # Keep only necessary columns
-    df_valid_trimmed = df_valid_full[["Category", "Current Fee", "Optimized Fee"]].copy()
-
-    # Convert to numeric
-    df_valid_trimmed["Current Fee"] = pd.to_numeric(df_valid_trimmed["Current Fee"], errors="coerce")
-    df_valid_trimmed["Optimized Fee"] = pd.to_numeric(df_valid_trimmed["Optimized Fee"], errors="coerce")
-
-    return df_valid_trimmed
+    # Normalize numeric
+    df_valid["Current Fee"] = pd.to_numeric(df_valid["Current Fee"], errors="coerce")
+    df_valid["Optimized Fee"] = pd.to_numeric(df_valid["Optimized Fee"], errors="coerce")
+    return df_valid
 
 rate_sheet = load_clean_rate_sheet()
 
 # ===============================
-# PDF PARSING
+# HELPER: RATE NORMALIZATION
 # ===============================
+def normalize_rate(val):
+    """Ensure rates are in decimal form (0.025 not 2.5)."""
+    if val is None:
+        return 0.0
+    try:
+        v = float(val)
+        return v / 100 if v > 1 else v
+    except:
+        return 0.0
+
+# ===============================
+# PDF PARSING (STRICT)
+# ===============================
+CATEGORY_KEYWORDS = ["PURCHAS", "CORPORATE", "BUSINESS", "TIER", "LEVEL", "LVL", "DATA"]
+
 def extract_categories_from_pdf(pdf_file):
-    """Extracts statement categories, volumes & statement rates from PDF text."""
+    """Extract ONLY valid Visa/MC category lines with rates."""
     extracted = []
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
-            if text:
-                for line in text.split("\n"):
-                    # Look for lines with % rate and $
-                    if re.search(r"\d+\.\d{2}\s", line) and "$" in line:
-                        extracted.append(line.strip())
-    return list(set(extracted))  # remove duplicates
+            if not text:
+                continue
+            for line in text.split("\n"):
+                # Must have VS/VI/MC AND known keyword AND a % or decimal rate
+                if re.search(r"(VS|VI|MC)", line.upper()) and \
+                   any(k in line.upper() for k in CATEGORY_KEYWORDS) and \
+                   re.search(r"\d+\.\d{2}", line):
+                    extracted.append(line.strip())
+    return list(set(extracted))  # unique valid lines only
 
 def parse_line_to_components(line):
-    """Extract category, volume & rate from a single line."""
-    # Take text before first $
-    parts = line.split("$")
-    category = parts[0].strip()
+    """Extract category text, volume, and normalized rate."""
+    # Category text before first $
+    category = line.split("$")[0].strip()
 
-    # Volume (first $amount in line)
+    # Volume
     volume_match = re.findall(r"\$[\d,]+\.\d{2}", line)
     volume = float(volume_match[0].replace("$","").replace(",","")) if volume_match else 0.0
 
-    # Rate (like 2.2000)
-    rate_match = re.findall(r"\d\.\d{3,4}", line)
-    rate = float(rate_match[-1]) if rate_match else 0.0
+    # Rate (normalize)
+    rate_match = re.findall(r"\d+\.\d{2,4}", line)
+    stmt_rate = normalize_rate(rate_match[-1]) if rate_match else 0.0
 
-    return category, volume, rate
+    return category, volume, stmt_rate
 
 # ===============================
-# GPT REASONING (LAST STEP)
+# GPT FINAL REASONING
 # ===============================
 def gpt_choose_best(statement_category, statement_rate, candidates, api_key):
-    """Ask GPT to choose the best match from a small filtered list."""
     client = OpenAI(api_key=api_key)
-
     candidate_text = "\n".join(
-        f"- {c['Category']} (Current Fee: {c['Current Fee']:.4%}, Optimized: {c['Optimized Fee']:.4%})"
+        f"- {c['Category']} (Current Fee: {normalize_rate(c['Current Fee']):.4%}, Optimized: {normalize_rate(c['Optimized Fee']):.4%})"
         for _, c in candidates.iterrows()
     )
 
     prompt = f"""
     You are a payment interchange expert.
 
-    Statement category from merchant:
-    - Description: "{statement_category}"
-    - Rate on statement: {statement_rate:.4%}
+    Statement category:
+    "{statement_category}"
+    Statement rate: {statement_rate:.4%}
 
-    Here are possible standard interchange categories:
+    Possible matches:
     {candidate_text}
 
-    Which one best matches the statement category?
-    Consider:
+    Choose the best match considering:
+    - Visa vs MC
     - Keyword similarity (Purchasing ≈ Purchasing, Level 2 ≈ LVL II)
-    - Network match (Visa vs MC)
-    - Rate similarity (statement vs current fee)
+    - Rate similarity
 
     Respond ONLY as JSON:
     {{
@@ -119,79 +123,75 @@ def gpt_choose_best(statement_category, statement_rate, candidates, api_key):
       "confidence": 0-100
     }}
     """
-
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "You are a payment interchange expert that matches merchant statement categories to standardized interchange categories."},
+            {"role": "system", "content": "You are a payment interchange expert that maps statement categories to standardized interchange categories."},
             {"role": "user", "content": prompt}
         ]
     )
     return completion.choices[0].message.content
 
 # ===============================
-# MULTI-STEP FILTER + MATCH + CALC
+# MATCHING PIPELINE
 # ===============================
-def match_and_calculate(categories_extracted, df_clean, api_key):
-    """Strict multi-step matching before GPT reasoning."""
+def match_and_calculate(lines, df_clean, api_key):
     results = []
 
-    for line in categories_extracted:
+    for line in lines:
         cat_text, volume, stmt_rate = parse_line_to_components(line)
-        network = "Visa" if "VS" in cat_text.upper() else "Mastercard" if "MC" in cat_text.upper() else "Other"
+        if stmt_rate == 0 or not cat_text:
+            continue
 
-        # Step 1: Filter by network
-        network_filter = df_clean[df_clean["Category"].str.contains("VI|Visa", case=False) if network == "Visa"
-                                 else df_clean["Category"].str.contains("MC|Mastercard", case=False)]
+        # Detect network
+        network = "Visa" if "VS" in cat_text.upper() or "VI" in cat_text.upper() else "Mastercard" if "MC" in cat_text.upper() else "Other"
 
-        # Step 2: Keyword filter (Purchasing, Tier, Level)
-        keywords = []
-        if "PURCH" in cat_text.upper():
-            keywords.append("Purchasing")
-        if "TIER" in cat_text.upper():
-            keywords.append("Tier")
-        if "LEVEL" in cat_text.upper() or "LVL" in cat_text.upper():
-            keywords.append("Level")
+        # Step 1: Network filter
+        if network == "Visa":
+            net_df = df_clean[df_clean["Category"].str.contains("VI|Visa", case=False)]
+        elif network == "Mastercard":
+            net_df = df_clean[df_clean["Category"].str.contains("MC|Master", case=False)]
+        else:
+            net_df = df_clean
 
-        keyword_filtered = network_filter.copy()
-        if keywords:
-            keyword_filtered = keyword_filtered[keyword_filtered["Category"].str.contains("|".join(keywords), case=False)]
+        # Step 2: Keyword filter
+        keyword_hits = [k for k in CATEGORY_KEYWORDS if k in cat_text.upper()]
+        key_df = net_df.copy()
+        if keyword_hits:
+            key_df = key_df[key_df["Category"].str.contains("|".join(keyword_hits), case=False)]
 
-        # Step 3: Rate sanity filter (within ~0.5%)
-        rate_filtered = keyword_filtered.copy()
+        # Step 3: Rate sanity filter (within 0.5%)
+        rate_df = key_df.copy()
         if stmt_rate > 0:
-            rate_filtered["diff"] = abs(rate_filtered["Current Fee"] - stmt_rate)
-            rate_filtered = rate_filtered[rate_filtered["diff"] <= 0.005]
+            rate_df["diff"] = abs(normalize_rate(rate_df["Current Fee"]) - stmt_rate)
+            rate_df = rate_df[rate_df["diff"] <= 0.005]
 
-        # If no match after filtering, fallback to full network list
-        candidate_pool = rate_filtered if not rate_filtered.empty else keyword_filtered
+        # Candidate pool
+        candidate_pool = rate_df if not rate_df.empty else key_df if not key_df.empty else net_df
 
-        # Step 4: If only 1 candidate → auto match
+        # Step 4: Decide match
         if len(candidate_pool) == 1:
-            match_row = candidate_pool.iloc[0]
-            matched_cat = match_row["Category"]
-            opt_rate = match_row["Optimized Fee"]
-            curr_fee_ref = match_row["Current Fee"]
-            confidence = "High (Unique Filtered Match)"
-        elif len(candidate_pool) > 1:
-            # Step 5: GPT choose best from small list
-            gpt_choice_raw = gpt_choose_best(cat_text, stmt_rate, candidate_pool.head(5), api_key)
+            row = candidate_pool.iloc[0]
+            matched_cat = row["Category"]
+            opt_rate = normalize_rate(row["Optimized Fee"])
+            curr_fee_ref = normalize_rate(row["Current Fee"])
+            confidence = "High (Unique Filtered)"
+        elif 1 < len(candidate_pool) <= 5:
+            gpt_raw = gpt_choose_best(cat_text, stmt_rate, candidate_pool, api_key)
             try:
                 import json
-                gpt_choice = json.loads(gpt_choice_raw)
-                matched_cat = gpt_choice["best_match"]
-                confidence = f"GPT {gpt_choice.get('confidence', '?')}%"
-                # find rates
-                match_row = candidate_pool[candidate_pool["Category"] == matched_cat].iloc[0]
-                opt_rate = match_row["Optimized Fee"]
-                curr_fee_ref = match_row["Current Fee"]
+                gpt_res = json.loads(gpt_raw)
+                matched_cat = gpt_res["best_match"]
+                confidence = f"GPT {gpt_res.get('confidence','?')}%"
+                row = candidate_pool[candidate_pool["Category"] == matched_cat].iloc[0]
+                opt_rate = normalize_rate(row["Optimized Fee"])
+                curr_fee_ref = normalize_rate(row["Current Fee"])
             except:
-                # fallback to best fuzzy
                 best_fuzzy = process.extractOne(cat_text, candidate_pool["Category"].tolist())[0]
-                match_row = candidate_pool[candidate_pool["Category"] == best_fuzzy].iloc[0]
+                row = candidate_pool[candidate_pool["Category"] == best_fuzzy].iloc[0]
                 matched_cat = best_fuzzy
-                opt_rate = match_row["Optimized Fee"]
-                curr_fee_ref = match_row["Current Fee"]
+                opt_rate = normalize_rate(row["Optimized Fee"])
+                curr_fee_ref = normalize_rate(row["Current Fee"])
                 confidence = "Medium (Fuzzy Fallback)"
         else:
             matched_cat = None
@@ -199,8 +199,7 @@ def match_and_calculate(categories_extracted, df_clean, api_key):
             curr_fee_ref = 0.0
             confidence = "Unmatched"
 
-        # Savings calc
-        savings = volume * (stmt_rate - opt_rate) if matched_cat else 0
+        savings = volume * (stmt_rate - opt_rate) if matched_cat else 0.0
 
         results.append({
             "Statement Category": cat_text,
@@ -221,27 +220,22 @@ def match_and_calculate(categories_extracted, df_clean, api_key):
 st.title("💳 Merchant Statement Interchange Savings Analyzer")
 
 st.markdown("""
-Upload a merchant credit card statement PDF.  
-The tool will:
-1. Detect Visa vs MasterCard  
-2. Pre-filter by keywords & rate similarity  
-3. Let GPT choose only if needed  
-4. Validate matches & calculate savings
+**How it works:**
+1. Extracts only valid Visa/MC interchange lines (skips dates & totals)
+2. Normalizes rates (1.9% = 0.019)
+3. Filters by network, keywords, and rate similarity
+4. Uses GPT ONLY for final ambiguous matches
+5. Calculates potential savings
 """)
 
-# OpenAI API key input
 api_key = st.text_input("Enter your OpenAI API Key", type="password")
-
-# File uploader
 uploaded_pdf = st.file_uploader("Upload Merchant Statement PDF", type=["pdf"])
 
 if uploaded_pdf and api_key:
-    # Step 1: Extract categories
-    with st.spinner("Extracting categories from statement..."):
+    with st.spinner("Extracting valid statement lines..."):
         categories_extracted = extract_categories_from_pdf(uploaded_pdf)
-        st.success(f"✅ Extracted {len(categories_extracted)} category lines from the statement.")
+        st.success(f"✅ Found {len(categories_extracted)} valid category lines")
 
-    # Step 2: Run strict matching & savings
     if st.button("Run Analysis"):
         with st.spinner("Filtering → GPT reasoning → Calculating savings..."):
             savings_df = match_and_calculate(categories_extracted[:10], rate_sheet, api_key)
@@ -252,7 +246,6 @@ if uploaded_pdf and api_key:
 
             st.markdown(f"**💰 Total Potential Monthly Savings: ${total_savings:,.2f}**")
 
-            # CSV download
             csv = savings_df.to_csv(index=False)
             st.download_button(
                 label="📥 Download Savings Report CSV",
