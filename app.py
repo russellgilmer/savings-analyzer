@@ -10,9 +10,6 @@ from openai import OpenAI
 # ===============================
 st.set_page_config(page_title="Merchant Statement Savings Analyzer", layout="wide")
 
-# ✅ Initialize OpenAI Client (we’ll set API key later)
-client = OpenAI()
-
 # ===============================
 # LOAD RATE SHEET
 # ===============================
@@ -66,8 +63,10 @@ def parse_line_to_components(line):
 # ===============================
 # GPT CATEGORY MATCHING (NEW OPENAI API)
 # ===============================
-def gpt_match_category(statement_category, known_categories):
+def gpt_match_category(statement_category, known_categories, api_key):
     """Use GPT to match a single statement category to the closest known category."""
+    client = OpenAI(api_key=api_key)  # ✅ Create client *inside* the function
+    
     prompt = f"""
     You are a payment interchange expert.
 
@@ -92,7 +91,7 @@ def gpt_match_category(statement_category, known_categories):
     )
     return completion.choices[0].message.content
 
-def match_and_calculate(categories_extracted, df_clean):
+def match_and_calculate(categories_extracted, df_clean, api_key):
     """For each parsed line, GPT matches it, then we calculate savings."""
     known_categories = df_clean["Category"].dropna().tolist()
     results = []
@@ -101,7 +100,7 @@ def match_and_calculate(categories_extracted, df_clean):
         cat, volume, stmt_rate = parse_line_to_components(line)
         
         # GPT match
-        gpt_result_raw = gpt_match_category(cat, known_categories)
+        gpt_result_raw = gpt_match_category(cat, known_categories, api_key)
         
         # Try parsing GPT JSON
         try:
@@ -140,8 +139,6 @@ The tool will extract interchange categories, match them to your standard catego
 
 # OpenAI API key input
 api_key = st.text_input("Enter your OpenAI API Key", type="password")
-if api_key:
-    client.api_key = api_key  # ✅ set OpenAI key
 
 # File uploader
 uploaded_pdf = st.file_uploader("Upload Merchant Statement PDF", type=["pdf"])
@@ -155,8 +152,8 @@ if uploaded_pdf and api_key:
     # Step 2: Run GPT matching & savings
     if st.button("Run Analysis"):
         with st.spinner("Matching categories with GPT + calculating savings..."):
-            # Limit to first 10 for demo speed (can remove limit for full processing)
-            savings_df = match_and_calculate(categories_extracted[:10], rate_sheet)
+            # Limit to first 10 for demo speed (remove limit for full processing)
+            savings_df = match_and_calculate(categories_extracted[:10], rate_sheet, api_key)
             total_savings = savings_df["Monthly Savings"].sum()
 
             st.subheader("📊 Savings Summary")
