@@ -204,7 +204,7 @@ def gpt_match_and_calculate(lines, df_clean, api_key):
             "Volume": volume,
             "Monthly Savings": savings,
             "Confidence": confidence,
-            "Reason": reason
+            "Reason": reason  # ✅ GPT explanation
         })
 
     return pd.DataFrame(results)
@@ -224,7 +224,9 @@ This version uses **GPT reasoning like a human analyst**:
    - Keyword similarity  
    - Rate closeness  
 4. GPT decides best match OR says *No Match*  
-5. Savings = Volume × (Statement Rate – Optimized Fee)
+5. Savings = Volume × (Statement Rate – Optimized Fee)  
+
+**You will also see GPT’s explanation for each match.**
 """)
 
 api_key = st.text_input("Enter your OpenAI API Key", type="password")
@@ -240,7 +242,7 @@ if uploaded_pdf and api_key:
             savings_df = gpt_match_and_calculate(statement_lines[:10], rate_sheet, api_key)
             total_savings = savings_df["Monthly Savings"].sum()
 
-            st.subheader("📊 GPT-Matched Savings Summary")
+            st.subheader("📊 GPT-Matched Savings Summary (with Reasoning)")
             st.dataframe(savings_df)
 
             st.markdown(f"**💰 Total Potential Monthly Savings: ${total_savings:,.2f}**")
