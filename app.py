@@ -85,27 +85,41 @@ def parse_line_to_components(line):
     return category, volume, rate
 
 # ===============================
-# GPT CATEGORY MATCHING
+# GPT REASONING (LAST STEP)
 # ===============================
-def gpt_match_category(statement_category, known_categories, api_key):
-    """Use GPT to match a single statement category to the closest known category."""
-    client = OpenAI(api_key=api_key)  # ✅ Create client *inside* the function
+def gpt_choose_best(statement_category, statement_rate, candidates, api_key):
+    """Ask GPT to choose the best match from a small filtered list."""
+    client = OpenAI(api_key=api_key)
+
+    candidate_text = "\n".join(
+        f"- {c['Category']} (Current Fee: {c['Current Fee']:.4%}, Optimized: {c['Optimized Fee']:.4%})"
+        for _, c in candidates.iterrows()
+    )
 
     prompt = f"""
     You are a payment interchange expert.
 
-    Statement category from a merchant statement: "{statement_category}"
+    Statement category from merchant:
+    - Description: "{statement_category}"
+    - Rate on statement: {statement_rate:.4%}
 
-    Standard interchange categories: {known_categories}
+    Here are possible standard interchange categories:
+    {candidate_text}
 
-    Find the best logical match from the list. Respond ONLY as JSON like:
+    Which one best matches the statement category?
+    Consider:
+    - Keyword similarity (Purchasing ≈ Purchasing, Level 2 ≈ LVL II)
+    - Network match (Visa vs MC)
+    - Rate similarity (statement vs current fee)
+
+    Respond ONLY as JSON:
     {{
-      "statement": "...",
-      "match": "...",
-      "confidence": 0-100,
-      "reason": "..."
+      "best_match": "...",
+      "reason": "...",
+      "confidence": 0-100
     }}
     """
+
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -116,55 +130,83 @@ def gpt_match_category(statement_category, known_categories, api_key):
     return completion.choices[0].message.content
 
 # ===============================
-# MATCH + VALIDATE + CALCULATE
+# MULTI-STEP FILTER + MATCH + CALC
 # ===============================
 def match_and_calculate(categories_extracted, df_clean, api_key):
-    """For each parsed line, GPT matches it, then we calculate savings & confidence."""
-    known_categories = df_clean["Category"].dropna().tolist()
+    """Strict multi-step matching before GPT reasoning."""
     results = []
 
     for line in categories_extracted:
-        cat, volume, stmt_rate = parse_line_to_components(line)
+        cat_text, volume, stmt_rate = parse_line_to_components(line)
+        network = "Visa" if "VS" in cat_text.upper() else "Mastercard" if "MC" in cat_text.upper() else "Other"
 
-        # GPT match
-        gpt_result_raw = gpt_match_category(cat, known_categories, api_key)
+        # Step 1: Filter by network
+        network_filter = df_clean[df_clean["Category"].str.contains("VI|Visa", case=False) if network == "Visa"
+                                 else df_clean["Category"].str.contains("MC|Mastercard", case=False)]
 
-        # Try parsing GPT JSON
-        try:
-            import json
-            gpt_result = json.loads(gpt_result_raw)
-            matched_cat = gpt_result.get("match")
-        except:
-            # Fallback: fuzzy match if GPT JSON fails
-            matched_cat = process.extractOne(cat, known_categories)[0]
+        # Step 2: Keyword filter (Purchasing, Tier, Level)
+        keywords = []
+        if "PURCH" in cat_text.upper():
+            keywords.append("Purchasing")
+        if "TIER" in cat_text.upper():
+            keywords.append("Tier")
+        if "LEVEL" in cat_text.upper() or "LVL" in cat_text.upper():
+            keywords.append("Level")
 
-        # Pull Current Fee & Optimized Fee for matched category
-        opt_row = df_clean[df_clean["Category"] == matched_cat]
-        if not opt_row.empty:
-            current_fee_ref = float(opt_row["Current Fee"].values[0])
-            opt_rate = float(opt_row["Optimized Fee"].values[0])
+        keyword_filtered = network_filter.copy()
+        if keywords:
+            keyword_filtered = keyword_filtered[keyword_filtered["Category"].str.contains("|".join(keywords), case=False)]
+
+        # Step 3: Rate sanity filter (within ~0.5%)
+        rate_filtered = keyword_filtered.copy()
+        if stmt_rate > 0:
+            rate_filtered["diff"] = abs(rate_filtered["Current Fee"] - stmt_rate)
+            rate_filtered = rate_filtered[rate_filtered["diff"] <= 0.005]
+
+        # If no match after filtering, fallback to full network list
+        candidate_pool = rate_filtered if not rate_filtered.empty else keyword_filtered
+
+        # Step 4: If only 1 candidate → auto match
+        if len(candidate_pool) == 1:
+            match_row = candidate_pool.iloc[0]
+            matched_cat = match_row["Category"]
+            opt_rate = match_row["Optimized Fee"]
+            curr_fee_ref = match_row["Current Fee"]
+            confidence = "High (Unique Filtered Match)"
+        elif len(candidate_pool) > 1:
+            # Step 5: GPT choose best from small list
+            gpt_choice_raw = gpt_choose_best(cat_text, stmt_rate, candidate_pool.head(5), api_key)
+            try:
+                import json
+                gpt_choice = json.loads(gpt_choice_raw)
+                matched_cat = gpt_choice["best_match"]
+                confidence = f"GPT {gpt_choice.get('confidence', '?')}%"
+                # find rates
+                match_row = candidate_pool[candidate_pool["Category"] == matched_cat].iloc[0]
+                opt_rate = match_row["Optimized Fee"]
+                curr_fee_ref = match_row["Current Fee"]
+            except:
+                # fallback to best fuzzy
+                best_fuzzy = process.extractOne(cat_text, candidate_pool["Category"].tolist())[0]
+                match_row = candidate_pool[candidate_pool["Category"] == best_fuzzy].iloc[0]
+                matched_cat = best_fuzzy
+                opt_rate = match_row["Optimized Fee"]
+                curr_fee_ref = match_row["Current Fee"]
+                confidence = "Medium (Fuzzy Fallback)"
         else:
-            current_fee_ref = 0.0
-            opt_rate = 0.019  # default fallback
+            matched_cat = None
+            opt_rate = 0.0
+            curr_fee_ref = 0.0
+            confidence = "Unmatched"
 
-        # Confidence check: compare statement rate vs reference current fee
-        if current_fee_ref > 0:
-            rate_diff = abs(stmt_rate - current_fee_ref)
-            if rate_diff <= 0.003:  # within ~0.3%
-                confidence = "High"
-            else:
-                confidence = "Low (Rate mismatch)"
-        else:
-            confidence = "Unknown"
-
-        # Calculate savings
-        savings = volume * (stmt_rate - opt_rate)
+        # Savings calc
+        savings = volume * (stmt_rate - opt_rate) if matched_cat else 0
 
         results.append({
-            "Statement Category": cat,
-            "Matched": matched_cat,
+            "Statement Category": cat_text,
+            "Matched": matched_cat if matched_cat else "No Match",
             "Statement Rate": stmt_rate,
-            "Ref Current Fee": current_fee_ref,
+            "Ref Current Fee": curr_fee_ref,
             "Optimized Rate": opt_rate,
             "Volume": volume,
             "Monthly Savings": savings,
@@ -180,7 +222,11 @@ st.title("💳 Merchant Statement Interchange Savings Analyzer")
 
 st.markdown("""
 Upload a merchant credit card statement PDF.  
-The tool will extract interchange categories, match them to your standard categories, validate by rate, and calculate potential savings.
+The tool will:
+1. Detect Visa vs MasterCard  
+2. Pre-filter by keywords & rate similarity  
+3. Let GPT choose only if needed  
+4. Validate matches & calculate savings
 """)
 
 # OpenAI API key input
@@ -195,10 +241,9 @@ if uploaded_pdf and api_key:
         categories_extracted = extract_categories_from_pdf(uploaded_pdf)
         st.success(f"✅ Extracted {len(categories_extracted)} category lines from the statement.")
 
-    # Step 2: Run GPT matching & savings
+    # Step 2: Run strict matching & savings
     if st.button("Run Analysis"):
-        with st.spinner("Matching categories with GPT, validating by rate & calculating savings..."):
-            # Limit to first 10 for demo speed (remove limit for full processing)
+        with st.spinner("Filtering → GPT reasoning → Calculating savings..."):
             savings_df = match_and_calculate(categories_extracted[:10], rate_sheet, api_key)
             total_savings = savings_df["Monthly Savings"].sum()
 
@@ -219,4 +264,4 @@ else:
     st.info("⬆️ Upload a PDF and enter your OpenAI API key to start.")
 
 st.markdown("---")
-st.caption("Powered by Curbstone + GPT reasoning for interchange optimization")
+st.caption("Powered by Curbstone + strict filtering + GPT reasoning")
